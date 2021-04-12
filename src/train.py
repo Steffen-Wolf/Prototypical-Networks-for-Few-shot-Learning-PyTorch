@@ -1,8 +1,14 @@
 # coding=utf-8
+import matplotlib
+matplotlib.use('agg')
+import matplotlib.pyplot as plt
+from skimage.io import imsave
+
 from prototypical_batch_sampler import PrototypicalBatchSampler
 from omniglot_dataset import OmniglotDataset
 from protonet import ProtoNet
 from parser_util import get_parser
+from itertools import islice
 
 from tqdm import tqdm
 import torch.nn as nn
@@ -24,9 +30,27 @@ def init_seed(opt):
 
 
 def init_dataloader(opt, mode):
-    dataset = FastDataset("/nrs/funke/wolfs2/lisl/datasets/fast_dsb.zarr",
-                          lim_images=1)
-    dataloader = torch.utils.data.DataLoader(dataset, batch_size=None, sampler=None)
+
+    dataset = FastDataset("/nrs/funke/wolfs2/lisl/datasets/fast_dsb_3.zarr",
+                          num_queries=opt.num_query_tr,
+                          num_support=opt.num_support_tr,
+                          num_class_per_iteration=opt.classes_per_it_tr,
+                          lim_images=opt.lim_images,
+                          lim_instances_per_image=opt.lim_instances_per_image,
+                          lim_clicks_per_instance=opt.lim_clicks_per_instance)
+
+    print(f"Training with {dataset.labeled_pixels} clicks")
+
+    # see https://github.com/pytorch/pytorch/issues/5059
+    def wif(id):
+        uint64_seed = torch.initial_seed()
+        np.random.seed([uint64_seed >> 32, uint64_seed & 0xffff_ffff])
+
+    dataloader = torch.utils.data.DataLoader(dataset,
+                                             batch_size=None,
+                                             sampler=None,
+                                             num_workers=10,
+                                             worker_init_fn=wif)
     return dataloader
 
 
@@ -65,6 +89,24 @@ def save_list_to_file(path, thelist):
         for item in thelist:
             f.write("%s\n" % item)
 
+def vis_embedding(output_file, coords, embedding):
+    with torch.no_grad():
+        coords = coords.detach().cpu().numpy()
+        embedding = embedding.detach().cpu().numpy() - coords
+        plt.quiver(coords[:, 0],
+                    coords[:, 1],
+                    embedding[:, 0],
+                    embedding[:, 1], 
+                    angles='xy',
+                    scale_units='xy',
+                    scale=1., color='#8fffdd')
+
+    # plt.axis('off')
+    plt.savefig(output_file, dpi=300, bbox_inches='tight')
+    plt.cla()
+    plt.clf()
+    plt.close()
+    
 
 def train(opt, tr_dataloader, model, loss_fn, optim, lr_scheduler, val_dataloader=None):
     '''
@@ -107,7 +149,9 @@ def train(opt, tr_dataloader, model, loss_fn, optim, lr_scheduler, val_dataloade
             continue
         val_iter = iter(val_dataloader)
         model.eval()
-        for batch in val_iter:
+        c = 1
+        # TODO: remove islice with propper val loader
+        for batch in islice(val_iter, 32):
             x, y = batch
             x, y = x.to(device), y.to(device)
             model_output, _ = model(x)
@@ -115,6 +159,7 @@ def train(opt, tr_dataloader, model, loss_fn, optim, lr_scheduler, val_dataloade
                                 n_support=opt.num_support_val)
             val_loss.append(loss.item())
             val_acc.append(acc.item())
+
         avg_loss = np.mean(val_loss[-opt.iterations:])
         avg_acc = np.mean(val_acc[-opt.iterations:])
         postfix = ' (Best)' if avg_acc >= best_acc else ' (Best: {})'.format(
@@ -212,34 +257,21 @@ def main():
                 loss_fn=loss_fn,
                 optim=optim,
                 lr_scheduler=lr_scheduler)
-    best_state, best_acc, train_loss, train_acc, val_loss, val_acc = res
-    print('Testing with last model..')
-    test(opt=options,
-         test_dataloader=test_dataloader,
-         model=model,
-         loss_fn=loss_fn)
 
-    model.load_state_dict(best_state)
-    print('Testing with best model..')
-    test(opt=options,
-         test_dataloader=test_dataloader,
-         model=model)
+    # best_state, best_acc, train_loss, train_acc, val_loss, val_acc = res
+    # print('Testing with last model..')
+    # test(opt=options,
+    #      test_dataloader=test_dataloader,
+    #      model=model,
+    #      loss_fn=loss_fn)
 
-    # optim = init_optim(options, model)
-    # lr_scheduler = init_lr_scheduler(options, optim)
-
-    # print('Training on train+val set..')
-    # train(opt=options,
-    #       tr_dataloader=trainval_dataloader,
-    #       val_dataloader=None,
-    #       model=model,
-    #       optim=optim,
-    #       lr_scheduler=lr_scheduler)
-
-    # print('Testing final model..')
+    # model.load_state_dict(best_state)
+    # print('Testing with best model..')
     # test(opt=options,
     #      test_dataloader=test_dataloader,
     #      model=model)
+
+
 
 
 if __name__ == '__main__':

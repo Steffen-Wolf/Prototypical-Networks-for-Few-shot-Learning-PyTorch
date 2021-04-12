@@ -79,8 +79,20 @@ def get_parser():
                         action='store_true',
                         help='enables cuda')
 
-    parser.add_argument('-distance_fn',
+    parser.add_argument('--distance_fn',
                         type=str,
                         default="rbf")
+
+    parser.add_argument('--lim_images',
+                        type=int,
+                        default=None)
+    
+    parser.add_argument('--lim_instances_per_image',
+                        type=int,
+                        default=None)
+    
+    parser.add_argument('--lim_clicks_per_instance',
+                        type=int,
+                        default=None)
 
     return parser

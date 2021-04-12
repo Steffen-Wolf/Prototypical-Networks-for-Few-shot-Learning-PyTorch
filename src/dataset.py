@@ -27,9 +27,7 @@ class FastDataset(Dataset):
                  ds_file,
                  num_queries=5,
                  num_support=2,
-                 num_class_per_iteration=5,                 
-                 num_images=None,
-                 num_instances_per_image=None,
+                 num_class_per_iteration=5,
                  lim_images=None,
                  lim_instances_per_image=None,
                  lim_clicks_per_instance=None):
@@ -43,7 +41,8 @@ class FastDataset(Dataset):
         self.lim_images = lim_images
         self.lim_instances_per_image = lim_instances_per_image
         self.lim_clicks_per_instance = lim_clicks_per_instance
-        self._length = 1024 
+        self._length = 2048
+        assert(lim_clicks_per_instance >= num_queries + num_support)
 
     def __len__(self):
         return self._length
@@ -60,38 +59,38 @@ class FastDataset(Dataset):
                     image_data = {}
                     image_data["foreground"] = ds_array[img_key][instance_key]["foreground"][:self.lim_clicks_per_instance]
                     image_data["background"] = ds_array[img_key][instance_key]["background"][:self.lim_clicks_per_instance]
-
                     image_instances.append(image_data)
             self._data.append(image_instances)
-
         return self._data
-          
-    def sample(self, source, size):
-        max_id = len(source)
-        if max_id > size:
-            # sample with without repitition
-            sample_idx = np.random.permutation(max_id)[:size]
-        else:
-            # not enough instances in this image
-            # TODO: raise warning?
-            # sample with repetition
-            sample_idx = np.random.randint(max_id, size=size)
 
+    @property
+    def labeled_pixels(self):
+        num_labeled_pixels = 0
+        for img_instanges in self.data:
+            for inst in img_instanges:
+                num_labeled_pixels += len(inst["foreground"])
+        return num_labeled_pixels
+
+    def sample(self, source, size, seed):
+        max_id = len(source)
+        if max_id <= size:
+            return source
+        # use index as seed to get a random, but reproducable order
+        sample_idx = np.random.choice(max_id, size, replace=False)
         if isinstance(source, list):
-            return  [source[i] for i in sample_idx]
+            return [source[i] for i in sample_idx]
         else:
             return source[sample_idx]
 
-    def __getitem__(self, _):
-        image_instances = random.choice(self.data)
-        image_instances = self.sample(image_instances, self.num_class_per_iteration)
+    def __getitem__(self, seed):
+        image_instances = self.sample(random.choice(self.data), self.num_class_per_iteration, seed)
 
         emb_data = []
         target_data = []
         target_idx = 0
         num_clicks_per_instance = self.num_queries + self.num_support
         for inst in image_instances:
-            emb_sample = self.sample(inst["foreground"], num_clicks_per_instance)
+            emb_sample = self.sample(inst["foreground"], num_clicks_per_instance, seed+1)
             emb_data.append(emb_sample)
 
             target_data.append([target_idx]*len(emb_sample))
