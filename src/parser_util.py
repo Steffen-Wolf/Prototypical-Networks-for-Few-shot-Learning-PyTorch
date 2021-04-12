@@ -79,4 +79,8 @@ def get_parser():
                         action='store_true',
                         help='enables cuda')
 
+    parser.add_argument('-distance_fn',
+                        type=str,
+                        default="rbf")
+
     return parser

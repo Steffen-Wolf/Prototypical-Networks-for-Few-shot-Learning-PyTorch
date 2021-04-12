@@ -1,15 +1,17 @@
 # coding=utf-8
 from prototypical_batch_sampler import PrototypicalBatchSampler
-from prototypical_loss import prototypical_loss as loss_fn
 from omniglot_dataset import OmniglotDataset
 from protonet import ProtoNet
 from parser_util import get_parser
 
 from tqdm import tqdm
+import torch.nn as nn
 import numpy as np
 import torch
 import os
-
+import zarr
+from dataset import FastDataset
+from lisl.models.prototypical_network import PrototypicalNetwork
 
 def init_seed(opt):
     '''
@@ -21,34 +23,10 @@ def init_seed(opt):
     torch.cuda.manual_seed(opt.manual_seed)
 
 
-def init_dataset(opt, mode):
-    dataset = OmniglotDataset(mode=mode, root=opt.dataset_root)
-    n_classes = len(np.unique(dataset.y))
-    if n_classes < opt.classes_per_it_tr or n_classes < opt.classes_per_it_val:
-        raise(Exception('There are not enough classes in the dataset in order ' +
-                        'to satisfy the chosen classes_per_it. Decrease the ' +
-                        'classes_per_it_{tr/val} option and try again.'))
-    return dataset
-
-
-def init_sampler(opt, labels, mode):
-    if 'train' in mode:
-        classes_per_it = opt.classes_per_it_tr
-        num_samples = opt.num_support_tr + opt.num_query_tr
-    else:
-        classes_per_it = opt.classes_per_it_val
-        num_samples = opt.num_support_val + opt.num_query_val
-
-    return PrototypicalBatchSampler(labels=labels,
-                                    classes_per_it=classes_per_it,
-                                    num_samples=num_samples,
-                                    iterations=opt.iterations)
-
-
 def init_dataloader(opt, mode):
-    dataset = init_dataset(opt, mode)
-    sampler = init_sampler(opt, dataset.y, mode)
-    dataloader = torch.utils.data.DataLoader(dataset, batch_sampler=sampler)
+    dataset = FastDataset("/nrs/funke/wolfs2/lisl/datasets/fast_dsb.zarr",
+                          lim_images=1)
+    dataloader = torch.utils.data.DataLoader(dataset, batch_size=None, sampler=None)
     return dataloader
 
 
@@ -57,7 +35,11 @@ def init_protonet(opt):
     Initialize the ProtoNet
     '''
     device = 'cuda:0' if torch.cuda.is_available() and opt.cuda else 'cpu'
-    model = ProtoNet().to(device)
+    # TODO: make available as options
+    in_channels = 544
+    inst_out_channels = 2
+    n_sem_classes = 2
+    model = PrototypicalNetwork(in_channels, inst_out_channels, n_sem_classes).to(device)
     return model
 
 
@@ -84,7 +66,7 @@ def save_list_to_file(path, thelist):
             f.write("%s\n" % item)
 
 
-def train(opt, tr_dataloader, model, optim, lr_scheduler, val_dataloader=None):
+def train(opt, tr_dataloader, model, loss_fn, optim, lr_scheduler, val_dataloader=None):
     '''
     Train the model with the prototypical learning algorithm
     '''
@@ -110,7 +92,7 @@ def train(opt, tr_dataloader, model, optim, lr_scheduler, val_dataloader=None):
             optim.zero_grad()
             x, y = batch
             x, y = x.to(device), y.to(device)
-            model_output = model(x)
+            model_output, _ = model(x)
             loss, acc = loss_fn(model_output, target=y,
                                 n_support=opt.num_support_tr)
             loss.backward()
@@ -128,7 +110,7 @@ def train(opt, tr_dataloader, model, optim, lr_scheduler, val_dataloader=None):
         for batch in val_iter:
             x, y = batch
             x, y = x.to(device), y.to(device)
-            model_output = model(x)
+            model_output, _ = model(x)
             loss, acc = loss_fn(model_output, target=y,
                                 n_support=opt.num_support_val)
             val_loss.append(loss.item())
@@ -153,7 +135,7 @@ def train(opt, tr_dataloader, model, optim, lr_scheduler, val_dataloader=None):
     return best_state, best_acc, train_loss, train_acc, val_loss, val_acc
 
 
-def test(opt, test_dataloader, model):
+def test(opt, test_dataloader, model, loss_fn):
     '''
     Test the model trained with the prototypical learning algorithm
     '''
@@ -164,7 +146,7 @@ def test(opt, test_dataloader, model):
         for batch in test_iter:
             x, y = batch
             x, y = x.to(device), y.to(device)
-            model_output = model(x)
+            model_output, _ = model(x)
             _, acc = loss_fn(model_output, target=y,
                              n_support=opt.num_support_val)
             avg_acc.append(acc.item())
@@ -202,6 +184,14 @@ def main():
     if not os.path.exists(options.experiment_root):
         os.makedirs(options.experiment_root)
 
+    if options.distance_fn == "euk":
+        from prototypical_loss import prototypical_loss as loss_fn
+    elif options.distance_fn == "rbf":
+        print("using RBF distance")
+        from prototypical_loss import prototypical_loss_rbf as loss_fn
+    else:
+        raise NotImplementedError("Unknown distance function")
+
     if torch.cuda.is_available() and not options.cuda:
         print("WARNING: You have a CUDA device, so you should probably run with --cuda")
 
@@ -219,13 +209,15 @@ def main():
                 tr_dataloader=tr_dataloader,
                 val_dataloader=val_dataloader,
                 model=model,
+                loss_fn=loss_fn,
                 optim=optim,
                 lr_scheduler=lr_scheduler)
     best_state, best_acc, train_loss, train_acc, val_loss, val_acc = res
     print('Testing with last model..')
     test(opt=options,
          test_dataloader=test_dataloader,
-         model=model)
+         model=model,
+         loss_fn=loss_fn)
 
     model.load_state_dict(best_state)
     print('Testing with best model..')

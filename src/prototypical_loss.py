@@ -33,8 +33,12 @@ def euclidean_dist(x, y):
 
     return torch.pow(x - y, 2).sum(2)
 
+def rbf_dist(x, y):
+    temp = 10.
+    dist = euclidean_dist(x, y)
+    return 1 - (-dist / temp).exp()
 
-def prototypical_loss(input, target, n_support):
+def general_prototypical_loss(input, target, n_support, dist_fn):
     '''
     Inspired by https://github.com/jakesnell/prototypical-networks/blob/master/protonets/models/few_shot.py
 
@@ -71,7 +75,7 @@ def prototypical_loss(input, target, n_support):
     query_idxs = torch.stack(list(map(lambda c: target_cpu.eq(c).nonzero()[n_support:], classes))).view(-1)
 
     query_samples = input.to('cpu')[query_idxs]
-    dists = euclidean_dist(query_samples, prototypes)
+    dists = dist_fn(query_samples, prototypes)
 
     log_p_y = F.log_softmax(-dists, dim=1).view(n_classes, n_query, -1)
 
@@ -84,3 +88,9 @@ def prototypical_loss(input, target, n_support):
     acc_val = y_hat.eq(target_inds.squeeze()).float().mean()
 
     return loss_val,  acc_val
+
+def prototypical_loss(input, target, n_support):
+    return general_prototypical_loss(input, target, n_support, euclidean_dist)
+
+def prototypical_loss_rbf(input, target, n_support):
+    return general_prototypical_loss(input, target, n_support, rbf_dist)
