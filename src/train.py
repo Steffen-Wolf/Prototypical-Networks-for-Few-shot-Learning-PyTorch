@@ -10,6 +10,7 @@ from protonet import ProtoNet
 from parser_util import get_parser
 from itertools import islice
 
+import torch.nn.functional as F
 from tqdm import tqdm
 import torch.nn as nn
 import numpy as np
@@ -31,7 +32,7 @@ def init_seed(opt):
 
 def init_dataloader(opt, mode):
 
-    dataset = FastDataset("/nrs/funke/wolfs2/lisl/datasets/fast_dsb_3.zarr",
+    dataset = FastDataset(opt.dataset_root,
                           num_queries=opt.num_query_tr,
                           num_support=opt.num_support_tr,
                           num_class_per_iteration=opt.classes_per_it_tr,
@@ -45,6 +46,8 @@ def init_dataloader(opt, mode):
     def wif(id):
         uint64_seed = torch.initial_seed()
         np.random.seed([uint64_seed >> 32, uint64_seed & 0xffff_ffff])
+
+    best_model_path = os.path.join(opt.experiment_root, 'best_model.pth')
 
     dataloader = torch.utils.data.DataLoader(dataset,
                                              batch_size=None,
@@ -60,8 +63,8 @@ def init_protonet(opt):
     '''
     device = 'cuda:0' if torch.cuda.is_available() and opt.cuda else 'cpu'
     # TODO: make available as options
-    in_channels = 544
-    inst_out_channels = 2
+    in_channels = 512 + 32 + 1
+    inst_out_channels = 4
     n_sem_classes = 2
     model = PrototypicalNetwork(in_channels, inst_out_channels, n_sem_classes).to(device)
     return model
@@ -125,34 +128,44 @@ def train(opt, tr_dataloader, model, loss_fn, optim, lr_scheduler, val_dataloade
 
     best_model_path = os.path.join(opt.experiment_root, 'best_model.pth')
     last_model_path = os.path.join(opt.experiment_root, 'last_model.pth')
-
     for epoch in range(opt.epochs):
+        c = 0
         print('=== Epoch: {} ==='.format(epoch))
         tr_iter = iter(tr_dataloader)
         model.train()
         for batch in tqdm(tr_iter):
             optim.zero_grad()
-            x, y = batch
-            x, y = x.to(device), y.to(device)
-            model_output, _ = model(x)
+            x, y, bg = batch
+            num_fg = len(x)
+            num_bg = len(bg)
+            inp = torch.cat((x, bg))
+            inp, y = inp.to(device), y.to(device)
+            model_output, sem_embedding = model(inp)
+            model_output = model_output[:num_fg]
+
             loss, acc = loss_fn(model_output, target=y,
                                 n_support=opt.num_support_tr)
-            loss.backward()
+
+            sem_target = torch.cat((y.new_ones(num_fg), y.new_zeros(num_bg)))
+            sem_loss = F.cross_entropy(sem_embedding,
+                                       sem_target)
+
+            (loss + sem_loss.to(loss.device)).backward()
             optim.step()
             train_loss.append(loss.item())
             train_acc.append(acc.item())
         avg_loss = np.mean(train_loss[-opt.iterations:])
         avg_acc = np.mean(train_acc[-opt.iterations:])
-        print('Avg Train Loss: {}, Avg Train Acc: {}'.format(avg_loss, avg_acc))
+        print('Avg Train Loss: {}, Avg Train Acc: {} Sem Loss {}'.format(avg_loss, avg_acc, float(sem_loss)))
         lr_scheduler.step()
+
         if val_dataloader is None:
             continue
         val_iter = iter(val_dataloader)
         model.eval()
-        c = 1
         # TODO: remove islice with propper val loader
         for batch in islice(val_iter, 32):
-            x, y = batch
+            x, y, _ = batch
             x, y = x.to(device), y.to(device)
             model_output, _ = model(x)
             loss, acc = loss_fn(model_output, target=y,
@@ -189,8 +202,8 @@ def test(opt, test_dataloader, model, loss_fn):
     for epoch in range(10):
         test_iter = iter(test_dataloader)
         for batch in test_iter:
-            x, y = batch
-            x, y = x.to(device), y.to(device)
+            x, y, bg = batch
+            x, y, bg = x.to(device), y.to(device), bg.to(device)
             model_output, _ = model(x)
             _, acc = loss_fn(model_output, target=y,
                              n_support=opt.num_support_val)
@@ -258,18 +271,7 @@ def main():
                 optim=optim,
                 lr_scheduler=lr_scheduler)
 
-    # best_state, best_acc, train_loss, train_acc, val_loss, val_acc = res
-    # print('Testing with last model..')
-    # test(opt=options,
-    #      test_dataloader=test_dataloader,
-    #      model=model,
-    #      loss_fn=loss_fn)
 
-    # model.load_state_dict(best_state)
-    # print('Testing with best model..')
-    # test(opt=options,
-    #      test_dataloader=test_dataloader,
-    #      model=model)
 
 
 

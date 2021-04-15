@@ -42,7 +42,8 @@ class FastDataset(Dataset):
         self.lim_instances_per_image = lim_instances_per_image
         self.lim_clicks_per_instance = lim_clicks_per_instance
         self._length = 2048
-        assert(lim_clicks_per_instance >= num_queries + num_support)
+
+        assert (lim_clicks_per_instance is None) or (lim_clicks_per_instance >= num_queries + num_support)
 
     def __len__(self):
         return self._length
@@ -71,29 +72,32 @@ class FastDataset(Dataset):
                 num_labeled_pixels += len(inst["foreground"])
         return num_labeled_pixels
 
-    def sample(self, source, size, seed):
+    def sample(self, source, size):
         max_id = len(source)
         if max_id <= size:
             return source
-        # use index as seed to get a random, but reproducable order
-        sample_idx = np.random.choice(max_id, size, replace=False)
-        if isinstance(source, list):
-            return [source[i] for i in sample_idx]
-        else:
-            return source[sample_idx]
 
-    def __getitem__(self, seed):
-        image_instances = self.sample(random.choice(self.data), self.num_class_per_iteration, seed)
+        sample_idx = np.random.choice(max_id, size, replace=False)
+        return [source[i] for i in sample_idx]
+
+
+    def __getitem__(self, _):
+        image_instances = self.sample(random.choice(self.data), self.num_class_per_iteration)
 
         emb_data = []
+        bg_data = []
         target_data = []
         target_idx = 0
         num_clicks_per_instance = self.num_queries + self.num_support
         for inst in image_instances:
-            emb_sample = self.sample(inst["foreground"], num_clicks_per_instance, seed+1)
+            emb_sample = self.sample(inst["foreground"],
+                                                num_clicks_per_instance)
+            bg_sample = self.sample(inst["background"],
+                                    num_clicks_per_instance*3)
             emb_data.append(emb_sample)
+            bg_data.append(bg_sample)
 
             target_data.append([target_idx]*len(emb_sample))
             target_idx += 1
 
-        return np.concatenate(emb_data), np.concatenate(target_data)
+        return np.concatenate(emb_data), np.concatenate(target_data), np.concatenate(bg_data)
