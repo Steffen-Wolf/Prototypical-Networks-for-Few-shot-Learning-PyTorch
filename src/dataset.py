@@ -61,16 +61,23 @@ class FastDataset(Dataset):
                     image_data["foreground"] = ds_array[img_key][instance_key]["foreground"][:self.lim_clicks_per_instance]
                     image_data["background"] = ds_array[img_key][instance_key]["background"][:self.lim_clicks_per_instance]
                     image_instances.append(image_data)
-            self._data.append(image_instances)
+                assert len(
+                    image_instances), f"no instances found in {self.ds_file}/{img_key}"
+                self._data.append(image_instances)
         return self._data
 
     @property
-    def labeled_pixels(self):
+    def labeled_images_instances_pixels(self):
         num_labeled_pixels = 0
+        num_labeled_images = 0
+        num_labeled_instances = 0
         for img_instanges in self.data:
+            num_labeled_images += 1
             for inst in img_instanges:
+                num_labeled_instances += 1
                 num_labeled_pixels += len(inst["foreground"])
-        return num_labeled_pixels
+
+        return num_labeled_images, num_labeled_instances, num_labeled_pixels
 
     def sample(self, source, size):
         max_id = len(source)

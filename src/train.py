@@ -39,8 +39,9 @@ def init_dataloader(opt, mode):
                           lim_images=opt.lim_images,
                           lim_instances_per_image=opt.lim_instances_per_image,
                           lim_clicks_per_instance=opt.lim_clicks_per_instance)
-
-    print(f"Training with {dataset.labeled_pixels} clicks")
+    num_labeled_images, num_labeled_instances, num_labeled_pixels = dataset.labeled_images_instances_pixels
+    print(
+        f"Training with {num_labeled_pixels} clicks, {num_labeled_instances} instances, {num_labeled_images}/{opt.lim_images} images")
 
     # see https://github.com/pytorch/pytorch/issues/5059
     def wif(id):
@@ -120,41 +121,60 @@ def train(opt, tr_dataloader, model, loss_fn, optim, lr_scheduler, val_dataloade
 
     if val_dataloader is None:
         best_state = None
-    train_loss = []
+    train_loss_log = [0]
+    fgbg_loss_log = [0]
+    inst_loss_log = [0]
     train_acc = []
     val_loss = []
     val_acc = []
     best_acc = 0
+    accum_grad = 16
 
     best_model_path = os.path.join(opt.experiment_root, 'best_model.pth')
     last_model_path = os.path.join(opt.experiment_root, 'last_model.pth')
+    optim.zero_grad()
+
     for epoch in range(opt.epochs):
         c = 0
         print('=== Epoch: {} ==='.format(epoch))
         tr_iter = iter(tr_dataloader)
         model.train()
-        for batch in tqdm(tr_iter):
-            optim.zero_grad()
+
+        for batch_number, batch in enumerate(tqdm(tr_iter)):
             x, y, bg = batch
             num_fg = len(x)
             num_bg = len(bg)
             inp = torch.cat((x, bg))
+            print("num_fg", num_fg, "num_bg", num_bg, "inp", inp.shape)
             inp, y = inp.to(device), y.to(device)
             model_output, sem_embedding = model(inp)
             model_output = model_output[:num_fg]
 
-            loss, acc = loss_fn(model_output, target=y,
+            inst_loss, acc = loss_fn(model_output, target=y,
                                 n_support=opt.num_support_tr)
 
             sem_target = torch.cat((y.new_ones(num_fg), y.new_zeros(num_bg)))
-            sem_loss = F.cross_entropy(sem_embedding,
+            sem_loss = 0.0001 * F.cross_entropy(sem_embedding,
                                        sem_target)
 
-            (loss + sem_loss.to(loss.device)).backward()
-            optim.step()
-            train_loss.append(loss.item())
+            loss = inst_loss + sem_loss.to(inst_loss.device)
+            loss = loss / accum_grad
+            loss.backward()
+
+            inst_loss_log[-1] += inst_loss.item()
+            fgbg_loss_log[-1] += sem_loss.item()
+            train_loss_log[-1] += loss.item()
+
+            if (batch_number + 1) % accum_grad == 0:
+                optim.step()
+                optim.zero_grad()
+
+                inst_loss_log.append(0)
+                fgbg_loss_log.append(0)
+                train_loss_log.append(0)
+
             train_acc.append(acc.item())
-        avg_loss = np.mean(train_loss[-opt.iterations:])
+        avg_loss = np.mean(train_loss_log[-opt.iterations:])
         avg_acc = np.mean(train_acc[-opt.iterations:])
         print('Avg Train Loss: {}, Avg Train Acc: {} Sem Loss {}'.format(avg_loss, avg_acc, float(sem_loss)))
         lr_scheduler.step()
@@ -186,11 +206,11 @@ def train(opt, tr_dataloader, model, loss_fn, optim, lr_scheduler, val_dataloade
 
     torch.save(model.state_dict(), last_model_path)
 
-    for name in ['train_loss', 'train_acc', 'val_loss', 'val_acc']:
+    for name in ['train_loss_log', 'train_acc', 'val_loss', 'val_acc', 'inst_loss_log', 'fgbg_loss_log']:
         save_list_to_file(os.path.join(opt.experiment_root,
                                        name + '.txt'), locals()[name])
 
-    return best_state, best_acc, train_loss, train_acc, val_loss, val_acc
+    return best_state, best_acc, train_loss_log, train_acc, val_loss, val_acc
 
 
 def test(opt, test_dataloader, model, loss_fn):
