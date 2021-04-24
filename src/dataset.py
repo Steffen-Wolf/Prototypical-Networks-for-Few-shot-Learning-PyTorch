@@ -55,15 +55,18 @@ class FastDataset(Dataset):
 
             ds_array = zarr.open(self.ds_file, "r")
             for img_key in islice(ds_array, self.lim_images):
-                image_instances = []
-                for instance_key in islice(ds_array[img_key], self.lim_instances_per_image):
+                
+                coordinates = []
+                for instance_key in islice(ds_array[img_key]["foreground"], self.lim_instances_per_image):
                     image_data = {}
-                    image_data["foreground"] = ds_array[img_key][instance_key]["foreground"][:self.lim_clicks_per_instance]
-                    image_data["background"] = ds_array[img_key][instance_key]["background"][:self.lim_clicks_per_instance]
-                    image_instances.append(image_data)
+                    image_data["foreground"] = ds_array[img_key]["foreground"][instance_key][:self.lim_clicks_per_instance]
+                    image_data["background"] = ds_array[img_key]["background"][instance_key][:self.lim_clicks_per_instance]
+                    image_data["raw"] = ds_array[img_key]["raw"]
+                    image_data["embedding"] = ds_array[img_key]["embedding"]
+                    coordinates.append(image_data)
                 assert len(
-                    image_instances), f"no instances found in {self.ds_file}/{img_key}"
-                self._data.append(image_instances)
+                    coordinates), f"no instances found in {self.ds_file}/{img_key}"
+                self._data.append(coordinates)
         return self._data
 
     @property
@@ -91,20 +94,27 @@ class FastDataset(Dataset):
     def __getitem__(self, _):
         image_instances = self.sample(random.choice(self.data), self.num_class_per_iteration)
 
-        emb_data = []
-        bg_data = []
+        instance_coordinates = []
+        bg_coordinates = []
         target_data = []
         target_idx = 0
         num_clicks_per_instance = self.num_queries + self.num_support
         for inst in image_instances:
-            emb_sample = self.sample(inst["foreground"],
+            raw = inst["raw"][:].astype(np.float32)
+            embedding = inst["embedding"][:].astype(np.float32)
+            coord_sample = self.sample(inst["foreground"],
                                                 num_clicks_per_instance)
-            bg_sample = self.sample(inst["background"],
+            bg_coord_sample = self.sample(inst["background"],
                                     num_clicks_per_instance*3)
-            emb_data.append(emb_sample)
-            bg_data.append(bg_sample)
+            instance_coordinates.append(coord_sample)
+            bg_coordinates.append(bg_coord_sample)
 
-            target_data.append([target_idx]*len(emb_sample))
+            target_data.append([target_idx]*len(coord_sample))
             target_idx += 1
 
-        return np.concatenate(emb_data), np.concatenate(target_data), np.concatenate(bg_data)
+        # raw, inp, instance_coordinates, y, background_coordinates
+        instance_coordinates = np.concatenate(instance_coordinates).astype(np.int64)
+        bg_coordinates = np.concatenate(bg_coordinates).astype(np.int64)
+        return raw[None], embedding[None], instance_coordinates, np.concatenate(target_data), bg_coordinates
+
+

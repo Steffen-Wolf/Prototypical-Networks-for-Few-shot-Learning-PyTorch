@@ -18,7 +18,7 @@ import torch
 import os
 import zarr
 from dataset import FastDataset
-from lisl.models.prototypical_network import PrototypicalNetwork
+from lisl.models.prototypical_network import PrototypicalNetwork, PrototypicalERFNetwork
 
 def init_seed(opt):
     '''
@@ -67,7 +67,8 @@ def init_protonet(opt):
     in_channels = 512 + 32 + 1
     inst_out_channels = 4
     n_sem_classes = 2
-    model = PrototypicalNetwork(in_channels, inst_out_channels, n_sem_classes).to(device)
+    # model = PrototypicalNetwork(in_channels, inst_out_channels, n_sem_classes).to(device)
+    model = PrototypicalERFNetwork(in_channels, inst_out_channels, n_sem_classes).to(device)
     return model
 
 
@@ -141,20 +142,25 @@ def train(opt, tr_dataloader, model, loss_fn, optim, lr_scheduler, val_dataloade
         model.train()
 
         for batch_number, batch in enumerate(tqdm(tr_iter)):
-            x, y, bg = batch
-            num_fg = len(x)
-            num_bg = len(bg)
-            inp = torch.cat((x, bg))
-            print("num_fg", num_fg, "num_bg", num_bg, "inp", inp.shape)
+            raw, inp, instance_coordinates, y, background_coordinates = batch
             inp, y = inp.to(device), y.to(device)
             model_output, sem_embedding = model(inp)
-            model_output = model_output[:num_fg]
 
-            inst_loss, acc = loss_fn(model_output, target=y,
+            inst_prediction = model_output[0, :, instance_coordinates[:, 0], instance_coordinates[:, 1]]
+            fg_prediction = sem_embedding[0, :,
+                                          instance_coordinates[:, 0], instance_coordinates[:, 1]]
+            bg_prediction = sem_embedding[0, :,
+                                          background_coordinates[:, 0], background_coordinates[:, 1]]
+
+            inst_loss, acc = loss_fn(torch.transpose(inst_prediction, 0, 1),
+                                target=y,
                                 n_support=opt.num_support_tr)
 
+            num_fg = fg_prediction.shape[1]
+            num_bg = bg_prediction.shape[1]
             sem_target = torch.cat((y.new_ones(num_fg), y.new_zeros(num_bg)))
-            sem_loss = 0.0001 * F.cross_entropy(sem_embedding,
+            sem_emb = torch.transpose(torch.cat((fg_prediction, bg_prediction), dim=1), 0, 1)
+            sem_loss = F.cross_entropy(sem_emb,
                                        sem_target)
 
             loss = inst_loss + sem_loss.to(inst_loss.device)
@@ -185,11 +191,15 @@ def train(opt, tr_dataloader, model, loss_fn, optim, lr_scheduler, val_dataloade
         model.eval()
         # TODO: remove islice with propper val loader
         for batch in islice(val_iter, 32):
-            x, y, _ = batch
-            x, y = x.to(device), y.to(device)
-            model_output, _ = model(x)
-            loss, acc = loss_fn(model_output, target=y,
+            raw, inp, instance_coordinates, y, background_coordinates = batch
+            inp, y = inp.to(device), y.to(device)
+            model_output, _ = model(inp)
+
+            inst_prediction = model_output[0, :, instance_coordinates[:, 0], instance_coordinates[:, 1]]
+            inst_loss, acc = loss_fn(torch.transpose(inst_prediction, 0, 1),
+                                target=y,
                                 n_support=opt.num_support_val)
+
             val_loss.append(loss.item())
             val_acc.append(acc.item())
 
