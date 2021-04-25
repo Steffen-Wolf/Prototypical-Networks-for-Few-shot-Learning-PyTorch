@@ -49,7 +49,6 @@ def init_dataloader(opt, mode):
         np.random.seed([uint64_seed >> 32, uint64_seed & 0xffff_ffff])
 
     best_model_path = os.path.join(opt.experiment_root, 'best_model.pth')
-
     dataloader = torch.utils.data.DataLoader(dataset,
                                              batch_size=None,
                                              sampler=None,
@@ -129,7 +128,7 @@ def train(opt, tr_dataloader, model, loss_fn, optim, lr_scheduler, val_dataloade
     val_loss = []
     val_acc = []
     best_acc = 0
-    accum_grad = 16
+    accum_grad = 2
 
     best_model_path = os.path.join(opt.experiment_root, 'best_model.pth')
     last_model_path = os.path.join(opt.experiment_root, 'last_model.pth')
@@ -146,11 +145,11 @@ def train(opt, tr_dataloader, model, loss_fn, optim, lr_scheduler, val_dataloade
             inp, y = inp.to(device), y.to(device)
             model_output, sem_embedding = model(inp)
 
-            inst_prediction = model_output[0, :, instance_coordinates[:, 0], instance_coordinates[:, 1]]
+            inst_prediction = model_output[0, :, instance_coordinates[:, 1], instance_coordinates[:, 0]]
             fg_prediction = sem_embedding[0, :,
-                                          instance_coordinates[:, 0], instance_coordinates[:, 1]]
+                                          instance_coordinates[:, 1], instance_coordinates[:, 0]]
             bg_prediction = sem_embedding[0, :,
-                                          background_coordinates[:, 0], background_coordinates[:, 1]]
+                                          background_coordinates[:, 1], background_coordinates[:, 0]]
 
             inst_loss, acc = loss_fn(torch.transpose(inst_prediction, 0, 1),
                                 target=y,
@@ -178,6 +177,23 @@ def train(opt, tr_dataloader, model, loss_fn, optim, lr_scheduler, val_dataloade
                 inst_loss_log.append(0)
                 fgbg_loss_log.append(0)
                 train_loss_log.append(0)
+        
+            if batch_number % 100 == 0:
+                eout = model_output.detach().cpu().numpy()[0]
+                for c in range(len(eout)):
+                    imsave(f"emb_{batch_number:08}_{c}.png", eout[c])
+
+                clicks = np.zeros(eout[0].shape)
+                clicks[instance_coordinates[:, 1], instance_coordinates[:, 0]] = 1
+                clicks[background_coordinates[:, 1], background_coordinates[:, 0]] = -1
+                print(clicks.shape)
+                imsave(f"raw_{batch_number:08}_clicks.png", clicks)
+
+                imsave(f"raw_{batch_number:08}.png",
+                           raw.detach().cpu().numpy()[0])
+
+                sout = sem_embedding.detach().softmax(dim=1).cpu().numpy()[0, 1]
+                imsave(f"sem_{batch_number:08}.png", sout)
 
             train_acc.append(acc.item())
         avg_loss = np.mean(train_loss_log[-opt.iterations:])
@@ -195,7 +211,7 @@ def train(opt, tr_dataloader, model, loss_fn, optim, lr_scheduler, val_dataloade
             inp, y = inp.to(device), y.to(device)
             model_output, _ = model(inp)
 
-            inst_prediction = model_output[0, :, instance_coordinates[:, 0], instance_coordinates[:, 1]]
+            inst_prediction = model_output[0, :, instance_coordinates[:, 1], instance_coordinates[:, 0]]
             inst_loss, acc = loss_fn(torch.transpose(inst_prediction, 0, 1),
                                 target=y,
                                 n_support=opt.num_support_val)

@@ -3,6 +3,8 @@ import numpy as np
 import zarr
 import random
 from itertools import islice
+from functools import partial
+from skimage.io import imsave
 
 class FastDataset(Dataset):
     """
@@ -35,6 +37,7 @@ class FastDataset(Dataset):
         self.ds_file = ds_file
         self.cache = zarr.open(ds_file, "r")
         self._data = None
+        self._aug_choices = None
         self.num_queries = num_queries
         self.num_support = num_support
         self.num_class_per_iteration = num_class_per_iteration
@@ -89,8 +92,77 @@ class FastDataset(Dataset):
 
         sample_idx = np.random.choice(max_id, size, replace=False)
         return [source[i] for i in sample_idx]
+        
+    def flip(self, img, axis=(-2)):
+        return np.ascontiguousarray(np.flip(img, axis=axis))
+    
+    def flip_coord(self, coord, axis=(-2, ), img_shape=(256, 256)):
+        for a in axis:
+            # switch coordinates
+            b = {-2: -1, -1: -2}[a]
+            coord[:, b] = img_shape[b] - coord[:, b] - 1
+        return coord
 
+    def rot(self, img, k=1):
+        return np.ascontiguousarray(np.rot90(img, k=k, axes=(-2,-1)))
 
+    def rot_coord(self, coord, k=1, img_shape=(256, 256)):
+        coord_out = np.copy(coord)
+        if k == 1:
+            coord_out[:, -2] = coord[:, -1]
+            coord_out[:, -1] = img_shape[-2] - coord[:, -2] - 1
+        elif k == 2:
+            coord_out[:, -2] = img_shape[-2] - coord[:, -2] - 1
+            coord_out[:, -1] = img_shape[-1] - coord[:, -1] - 1
+        elif k == 3:
+            coord_out[:, -2] = img_shape[-1] - coord[:, -1] - 1
+            coord_out[:, -1] = coord[:, -2]          
+        elif k > 3:
+            raise NotImplementedError()
+        return coord_out
+
+    def transpose(self, img):
+        return np.ascontiguousarray(np.transpose(img, (-2, -1)))
+        
+    def transpose_coord(self, coord, img_shape=(256, 256)):
+        coord_out = np.copy(coord)
+        coord_out[:, -2] = coord[:, -2]
+        coord_out[:, -1] = coord[:, -1]
+        return coord_out
+
+    @property
+    def aug_choices(self):
+        if self._aug_choices is None:
+            self._aug_choices = [(None, None)]
+                # (self.transpose, self.transpose_coord)]
+            for k in [1, 2, 3]:
+                self._aug_choices.append((partial(self.rot, k=k),
+                                        partial(self.rot_coord, k=k)))
+            for axis in [(-2, ), (-1, ), (-2, -1)]:
+                self._aug_choices.append((partial(self.flip, axis=axis),
+                                          partial(self.flip_coord, axis=axis)))
+        return self._aug_choices
+
+    def get_random_augment(self):
+        return random.choice(self.aug_choices)
+
+    def augment(self,
+                raw,
+                embedding,
+                instance_coordinates,
+                target_data,
+                bg_coordinates):
+
+        img_augment, coord_augment = self.get_random_augment()
+        if img_augment is None:
+            return raw, embedding, instance_coordinates, target_data, bg_coordinates
+        else:
+            return img_augment(raw), \
+                   img_augment(embedding), \
+                   coord_augment(instance_coordinates, img_shape=raw.shape[-2:]), \
+                   target_data, \
+                   coord_augment(bg_coordinates, img_shape=raw.shape[-2:])
+    
     def __getitem__(self, _):
         image_instances = self.sample(random.choice(self.data), self.num_class_per_iteration)
 
@@ -115,6 +187,7 @@ class FastDataset(Dataset):
         # raw, inp, instance_coordinates, y, background_coordinates
         instance_coordinates = np.concatenate(instance_coordinates).astype(np.int64)
         bg_coordinates = np.concatenate(bg_coordinates).astype(np.int64)
-        return raw[None], embedding[None], instance_coordinates, np.concatenate(target_data), bg_coordinates
 
+        raw, embedding, instance_coordinates, target_data, bg_coordinates = self.augment(raw[None], embedding[None], instance_coordinates, np.concatenate(target_data), bg_coordinates)
 
+        return raw, embedding, instance_coordinates, target_data, bg_coordinates
