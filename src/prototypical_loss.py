@@ -33,12 +33,13 @@ def euclidean_dist(x, y):
 
     return torch.pow(x - y, 2).sum(2)
 
-def rbf_dist(x, y):
-    temp = 10.
+
+def rbf_dist(x, y, temp):
     dist = euclidean_dist(x, y)
     return 1 - (-dist / temp).exp()
 
-def general_prototypical_loss(input, target, n_support, dist_fn):
+
+def general_prototypical_loss(input, target, n_support, dist_fn, temperature, bg_support):
     '''
     Inspired by https://github.com/jakesnell/prototypical-networks/blob/master/protonets/models/few_shot.py
 
@@ -71,26 +72,32 @@ def general_prototypical_loss(input, target, n_support, dist_fn):
     support_idxs = list(map(supp_idxs, classes))
 
     prototypes = torch.stack([input_cpu[idx_list].mean(0) for idx_list in support_idxs])
+    # add bg_support points (as distractors)
+    prototypes = torch.cat((prototypes, bg_support.to(prototypes.device)))
+
     # FIXME when torch will support where as np
     query_idxs = torch.stack(list(map(lambda c: target_cpu.eq(c).nonzero()[n_support:], classes))).view(-1)
 
     query_samples = input.to('cpu')[query_idxs]
-    dists = dist_fn(query_samples, prototypes)
+    dists = dist_fn(query_samples, prototypes, temperature)
 
     log_p_y = F.log_softmax(-dists, dim=1).view(n_classes, n_query, -1)
 
-    target_inds = torch.arange(0, n_classes)
+    target_inds = torch.arange(0, n_classes)#.repeat_interleave(n_query)
     target_inds = target_inds.view(n_classes, 1, 1)
     target_inds = target_inds.expand(n_classes, n_query, 1).long()
 
+    # loss_val = F.cross_entropy(dists, target_inds)
     loss_val = -log_p_y.gather(2, target_inds).squeeze().view(-1).mean()
+    
     _, y_hat = log_p_y.max(2)
     acc_val = y_hat.eq(target_inds.squeeze()).float().mean()
 
     return loss_val,  acc_val
 
-def prototypical_loss(input, target, n_support):
-    return general_prototypical_loss(input, target, n_support, euclidean_dist)
+def prototypical_loss(input, target, n_support, temperature, bg_support):
+    return general_prototypical_loss(input, target, n_support, euclidean_dist, temperature, bg_support)
 
-def prototypical_loss_rbf(input, target, n_support):
-    return general_prototypical_loss(input, target, n_support, rbf_dist)
+
+def prototypical_loss_rbf(input, target, n_support, temperature, bg_support):
+    return general_prototypical_loss(input, target, n_support, rbf_dist, temperature, bg_support)

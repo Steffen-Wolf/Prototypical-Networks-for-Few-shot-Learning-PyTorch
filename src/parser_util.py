@@ -43,7 +43,7 @@ def get_parser():
     parser.add_argument('-cTr', '--classes_per_it_tr',
                         type=int,
                         help='number of random classes per episode for training, default=60',
-                        default=60)
+                        default=None)
 
     parser.add_argument('-nsTr', '--num_support_tr',
                         type=int,
@@ -83,6 +83,10 @@ def get_parser():
                         type=str,
                         default="rbf")
 
+    parser.add_argument('--inst_embedding_channels',
+                        type=int,
+                        default=16)
+
     parser.add_argument('--lim_images',
                         type=int,
                         default=None)
@@ -94,5 +98,9 @@ def get_parser():
     parser.add_argument('--lim_clicks_per_instance',
                         type=int,
                         default=None)
+
+    parser.add_argument('--bg_weight',
+                        type=float,
+                        default=5.)
 
     return parser

@@ -5,6 +5,7 @@ import random
 from itertools import islice
 from functools import partial
 from skimage.io import imsave
+from scipy.ndimage import zoom
 
 class FastDataset(Dataset):
     """
@@ -29,7 +30,7 @@ class FastDataset(Dataset):
                  ds_file,
                  num_queries=5,
                  num_support=2,
-                 num_class_per_iteration=5,
+                 num_class_per_iteration=None,
                  lim_images=None,
                  lim_instances_per_image=None,
                  lim_clicks_per_instance=None):
@@ -45,6 +46,8 @@ class FastDataset(Dataset):
         self.lim_instances_per_image = lim_instances_per_image
         self.lim_clicks_per_instance = lim_clicks_per_instance
         self._length = 2048
+        self._aug_scale = 0.5
+        self._aug_pos = None
 
         assert (lim_clicks_per_instance is None) or (lim_clicks_per_instance >= num_queries + num_support)
 
@@ -130,6 +133,24 @@ class FastDataset(Dataset):
         coord_out[:, -1] = coord[:, -1]
         return coord_out
 
+    def update_aug_scale(self):
+        self._aug_scale = random.uniform(0.5, 1.)
+
+    def scale(self, img):
+        zf = ([1, ] * (img.ndim - 2)) + ([self._aug_scale,] * 2)
+        scaled_img = zoom(img, zf, mode='reflect')
+        out_img = 0 * img
+        w = scaled_img.shape[-2]
+        h = scaled_img.shape[-1]
+        out_img[..., :w, :h] = scaled_img
+        return out_img
+
+    def scale_cood(self, coord, img_shape=(256, 256)):
+        coord_out = np.copy(coord)
+        coord_out[:, -2] = self._aug_scale * coord[:, -2]
+        coord_out[:, -1] = self._aug_scale * coord[:, -1]
+        return coord_out
+
     @property
     def aug_choices(self):
         if self._aug_choices is None:
@@ -144,6 +165,7 @@ class FastDataset(Dataset):
         return self._aug_choices
 
     def get_random_augment(self):
+        self.update_aug_scale()
         return random.choice(self.aug_choices)
 
     def augment(self,
@@ -153,18 +175,28 @@ class FastDataset(Dataset):
                 target_data,
                 bg_coordinates):
 
-        img_augment, coord_augment = self.get_random_augment()
-        if img_augment is None:
-            return raw, embedding, instance_coordinates, target_data, bg_coordinates
-        else:
-            return img_augment(raw), \
-                   img_augment(embedding), \
-                   coord_augment(instance_coordinates, img_shape=raw.shape[-2:]), \
-                   target_data, \
-                   coord_augment(bg_coordinates, img_shape=raw.shape[-2:])
+        # img_augment, coord_augment = self.get_random_augment()
+        # if img_augment is None:
+        return raw, embedding, instance_coordinates, target_data, bg_coordinates
+        # else:
+        #     if random.random() < 0.1:
+        #         raw = self.scale(raw)
+        #         embedding = self.scale(embedding)
+        #         instance_coordinates = self.scale_cood(instance_coordinates)
+        #         bg_coordinates = self.scale_cood(bg_coordinates)
+
+        #     return img_augment(raw), \
+        #            img_augment(embedding), \
+        #            coord_augment(instance_coordinates, img_shape=raw.shape[-2:]), \
+        #            target_data, \
+        #            coord_augment(bg_coordinates, img_shape=raw.shape[-2:])
     
     def __getitem__(self, _):
-        image_instances = self.sample(random.choice(self.data), self.num_class_per_iteration)
+
+        if self.num_class_per_iteration is None:
+            image_instances = random.choice(self.data)
+        else:
+            image_instances = self.sample(random.choice(self.data), self.num_class_per_iteration)
 
         instance_coordinates = []
         bg_coordinates = []
@@ -188,6 +220,4 @@ class FastDataset(Dataset):
         instance_coordinates = np.concatenate(instance_coordinates).astype(np.int64)
         bg_coordinates = np.concatenate(bg_coordinates).astype(np.int64)
 
-        raw, embedding, instance_coordinates, target_data, bg_coordinates = self.augment(raw[None], embedding[None], instance_coordinates, np.concatenate(target_data), bg_coordinates)
-
-        return raw, embedding, instance_coordinates, target_data, bg_coordinates
+        return self.augment(raw[None], embedding[None], instance_coordinates, np.concatenate(target_data), bg_coordinates)

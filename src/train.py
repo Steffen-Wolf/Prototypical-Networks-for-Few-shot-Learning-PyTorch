@@ -9,7 +9,7 @@ from omniglot_dataset import OmniglotDataset
 from protonet import ProtoNet
 from parser_util import get_parser
 from itertools import islice
-
+import random
 import torch.nn.functional as F
 from tqdm import tqdm
 import torch.nn as nn
@@ -52,7 +52,7 @@ def init_dataloader(opt, mode):
     dataloader = torch.utils.data.DataLoader(dataset,
                                              batch_size=None,
                                              sampler=None,
-                                             num_workers=10,
+                                             num_workers=50,
                                              worker_init_fn=wif)
     return dataloader
 
@@ -64,7 +64,7 @@ def init_protonet(opt):
     device = 'cuda:0' if torch.cuda.is_available() and opt.cuda else 'cpu'
     # TODO: make available as options
     in_channels = 512 + 32 + 1
-    inst_out_channels = 4
+    inst_out_channels = opt.inst_embedding_channels
     n_sem_classes = 2
     # model = PrototypicalNetwork(in_channels, inst_out_channels, n_sem_classes).to(device)
     model = PrototypicalERFNetwork(in_channels, inst_out_channels, n_sem_classes).to(device)
@@ -112,7 +112,7 @@ def vis_embedding(output_file, coords, embedding):
     plt.close()
     
 
-def train(opt, tr_dataloader, model, loss_fn, optim, lr_scheduler, val_dataloader=None):
+def train(opt, tr_dataloader, model, loss_fn, optim, lr_scheduler, bg_weight=10., val_dataloader=None):
     '''
     Train the model with the prototypical learning algorithm
     '''
@@ -124,11 +124,16 @@ def train(opt, tr_dataloader, model, loss_fn, optim, lr_scheduler, val_dataloade
     train_loss_log = [0]
     fgbg_loss_log = [0]
     inst_loss_log = [0]
+    # reg_loss_log = [0]
     train_acc = []
     val_loss = []
     val_acc = []
     best_acc = 0
     accum_grad = 2
+    temperature = 20.
+    nemb = opt.inst_embedding_channels
+    spatial_scaling = torch.Tensor(
+        2 * [1/temperature, ] + [1., ] * (nemb-2))[:, None].to(device)
 
     best_model_path = os.path.join(opt.experiment_root, 'best_model.pth')
     last_model_path = os.path.join(opt.experiment_root, 'last_model.pth')
@@ -138,6 +143,19 @@ def train(opt, tr_dataloader, model, loss_fn, optim, lr_scheduler, val_dataloade
         c = 0
         print('=== Epoch: {} ==='.format(epoch))
         tr_iter = iter(tr_dataloader)
+
+        if epoch >= opt.epochs // 4:
+            temperature = 10.
+            spatial_scaling = torch.Tensor(2 * [1/temperature,] + [1.,] * (nemb-2))[:, None].to(device)
+
+        if epoch >= opt.epochs // 2:
+            temperature = 2.
+            spatial_scaling = torch.Tensor(2 * [1/temperature,] + [1.,] * (nemb-2))[:, None].to(device)
+
+        if epoch >= 3* (opt.epochs // 4):
+            temperature = 1.
+            spatial_scaling = torch.Tensor(2 * [1/temperature,] + [1.,] * (nemb-2))[:, None].to(device)
+
         model.train()
 
         for batch_number, batch in enumerate(tqdm(tr_iter)):
@@ -146,23 +164,27 @@ def train(opt, tr_dataloader, model, loss_fn, optim, lr_scheduler, val_dataloade
             model_output, sem_embedding = model(inp)
 
             inst_prediction = model_output[0, :, instance_coordinates[:, 1], instance_coordinates[:, 0]]
+            bg_inst_prediction = model_output[0, :, background_coordinates[:, 1], background_coordinates[:, 0]]
             fg_prediction = sem_embedding[0, :,
                                           instance_coordinates[:, 1], instance_coordinates[:, 0]]
             bg_prediction = sem_embedding[0, :,
                                           background_coordinates[:, 1], background_coordinates[:, 0]]
-
-            inst_loss, acc = loss_fn(torch.transpose(inst_prediction, 0, 1),
-                                target=y,
-                                n_support=opt.num_support_tr)
+            inst_loss, acc = loss_fn(torch.transpose(spatial_scaling*inst_prediction, 0, 1),
+                                     target=y,
+                                     n_support=opt.num_support_tr,
+                                     temperature=temperature,
+                                     bg_support=(spatial_scaling*bg_inst_prediction).transpose(0, 1))
 
             num_fg = fg_prediction.shape[1]
             num_bg = bg_prediction.shape[1]
             sem_target = torch.cat((y.new_ones(num_fg), y.new_zeros(num_bg)))
             sem_emb = torch.transpose(torch.cat((fg_prediction, bg_prediction), dim=1), 0, 1)
+            weight = torch.tensor([bg_weight, 1.]).to(sem_emb.device)
             sem_loss = F.cross_entropy(sem_emb,
-                                       sem_target)
+                                       sem_target,
+                                       weight=weight)
 
-            loss = inst_loss + sem_loss.to(inst_loss.device)
+            loss = inst_loss + sem_loss.to(inst_loss.device)# + reg.to(inst_loss.device)
             loss = loss / accum_grad
             loss.backward()
 
@@ -196,6 +218,10 @@ def train(opt, tr_dataloader, model, loss_fn, optim, lr_scheduler, val_dataloade
                 imsave(f"sem_{batch_number:08}.png", sout)
 
             train_acc.append(acc.item())
+
+        current_model_path = os.path.join(opt.experiment_root, f'model_{epoch:04}.pth')
+        torch.save(model.state_dict(), current_model_path)
+        
         avg_loss = np.mean(train_loss_log[-opt.iterations:])
         avg_acc = np.mean(train_acc[-opt.iterations:])
         print('Avg Train Loss: {}, Avg Train Acc: {} Sem Loss {}'.format(avg_loss, avg_acc, float(sem_loss)))
@@ -206,15 +232,20 @@ def train(opt, tr_dataloader, model, loss_fn, optim, lr_scheduler, val_dataloade
         val_iter = iter(val_dataloader)
         model.eval()
         # TODO: remove islice with propper val loader
-        for batch in islice(val_iter, 32):
-            raw, inp, instance_coordinates, y, background_coordinates = batch
-            inp, y = inp.to(device), y.to(device)
-            model_output, _ = model(inp)
+        with torch.no_grad():
+            for batch in islice(val_iter, 32):
+                raw, inp, instance_coordinates, y, background_coordinates = batch
+                inp, y = inp.to(device), y.to(device)
+                model_output, _ = model(inp)
 
-            inst_prediction = model_output[0, :, instance_coordinates[:, 1], instance_coordinates[:, 0]]
-            inst_loss, acc = loss_fn(torch.transpose(inst_prediction, 0, 1),
-                                target=y,
-                                n_support=opt.num_support_val)
+                inst_prediction = model_output[0, :, instance_coordinates[:, 1], instance_coordinates[:, 0]]
+                bg_inst_prediction = model_output[0, :,
+                                                background_coordinates[:, 1], background_coordinates[:, 0]]
+                inst_loss, acc = loss_fn(torch.transpose(inst_prediction, 0, 1),
+                                    target=y,
+                                    n_support=opt.num_support_val,
+                                    temperature=temperature,
+                                    bg_support=bg_inst_prediction.transpose(0, 1))
 
             val_loss.append(loss.item())
             val_acc.append(acc.item())
@@ -245,6 +276,8 @@ def test(opt, test_dataloader, model, loss_fn):
     '''
     device = 'cuda:0' if torch.cuda.is_available() and opt.cuda else 'cpu'
     avg_acc = list()
+    temperature = 10
+
     for epoch in range(10):
         test_iter = iter(test_dataloader)
         for batch in test_iter:
@@ -252,7 +285,8 @@ def test(opt, test_dataloader, model, loss_fn):
             x, y, bg = x.to(device), y.to(device), bg.to(device)
             model_output, _ = model(x)
             _, acc = loss_fn(model_output, target=y,
-                             n_support=opt.num_support_val)
+                             n_support=opt.num_support_val,
+                             temperature=temperature)
             avg_acc.append(acc.item())
     avg_acc = np.mean(avg_acc)
     print('Test Acc: {}'.format(avg_acc))
@@ -302,24 +336,19 @@ def main():
     init_seed(options)
 
     tr_dataloader = init_dataloader(options, 'train')
-    val_dataloader = init_dataloader(options, 'val')
     # trainval_dataloader = init_dataloader(options, 'trainval')
-    test_dataloader = init_dataloader(options, 'test')
 
     model = init_protonet(options)
     optim = init_optim(options, model)
     lr_scheduler = init_lr_scheduler(options, optim)
     res = train(opt=options,
                 tr_dataloader=tr_dataloader,
-                val_dataloader=val_dataloader,
+                val_dataloader=tr_dataloader,
                 model=model,
                 loss_fn=loss_fn,
                 optim=optim,
-                lr_scheduler=lr_scheduler)
-
-
-
-
+                lr_scheduler=lr_scheduler,
+                bg_weight=options.bg_weight)
 
 
 if __name__ == '__main__':
