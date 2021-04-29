@@ -66,8 +66,11 @@ def init_protonet(opt):
     in_channels = 512 + 32 + 1
     inst_out_channels = opt.inst_embedding_channels
     n_sem_classes = 2
-    # model = PrototypicalNetwork(in_channels, inst_out_channels, n_sem_classes).to(device)
-    model = PrototypicalERFNetwork(in_channels, inst_out_channels, n_sem_classes).to(device)
+
+    if opt.train_on_raw:
+        model = PrototypicalERFNetwork(1, inst_out_channels, n_sem_classes).to(device)
+    else:
+        model = PrototypicalERFNetwork(in_channels, inst_out_channels, n_sem_classes).to(device)
     return model
 
 
@@ -160,7 +163,12 @@ def train(opt, tr_dataloader, model, loss_fn, optim, lr_scheduler, bg_weight=10.
 
         for batch_number, batch in enumerate(tqdm(tr_iter)):
             raw, inp, instance_coordinates, y, background_coordinates = batch
-            inp, y = inp.to(device), y.to(device)
+
+            if opt.train_on_raw:
+                inp, y = raw.to(device), y.to(device)
+            else:
+                inp, y = inp.to(device), y.to(device)
+
             model_output, sem_embedding = model(inp)
 
             inst_prediction = model_output[0, :, instance_coordinates[:, 1], instance_coordinates[:, 0]]
@@ -212,7 +220,7 @@ def train(opt, tr_dataloader, model, loss_fn, optim, lr_scheduler, bg_weight=10.
                 imsave(f"raw_{batch_number:08}_clicks.png", clicks)
 
                 imsave(f"raw_{batch_number:08}.png",
-                           raw.detach().cpu().numpy()[0])
+                           raw.detach().cpu().numpy()[0, 0])
 
                 sout = sem_embedding.detach().softmax(dim=1).cpu().numpy()[0, 1]
                 imsave(f"sem_{batch_number:08}.png", sout)
@@ -235,7 +243,12 @@ def train(opt, tr_dataloader, model, loss_fn, optim, lr_scheduler, bg_weight=10.
         with torch.no_grad():
             for batch in islice(val_iter, 32):
                 raw, inp, instance_coordinates, y, background_coordinates = batch
-                inp, y = inp.to(device), y.to(device)
+
+                if opt.train_on_raw:
+                    inp, y = raw.to(device), y.to(device)
+                else:
+                    inp, y = inp.to(device), y.to(device)
+                
                 model_output, _ = model(inp)
 
                 inst_prediction = model_output[0, :, instance_coordinates[:, 1], instance_coordinates[:, 0]]

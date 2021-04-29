@@ -103,4 +103,7 @@ def get_parser():
                         type=float,
                         default=5.)
 
+    parser.add_argument('--train_on_raw',
+                        action='store_true')
+
     return parser

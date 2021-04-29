@@ -220,4 +220,4 @@ class FastDataset(Dataset):
         instance_coordinates = np.concatenate(instance_coordinates).astype(np.int64)
         bg_coordinates = np.concatenate(bg_coordinates).astype(np.int64)
 
-        return self.augment(raw[None], embedding[None], instance_coordinates, np.concatenate(target_data), bg_coordinates)
+        return self.augment(raw[None, None], embedding[None], instance_coordinates, np.concatenate(target_data), bg_coordinates)
