@@ -20,6 +20,7 @@ import zarr
 from dataset import FastDataset
 from lisl.models.prototypical_network import PrototypicalNetwork, PrototypicalERFNetwork
 
+
 def init_seed(opt):
     '''
     Disable cudnn to maximize reproducibility
@@ -52,7 +53,7 @@ def init_dataloader(opt, mode):
     dataloader = torch.utils.data.DataLoader(dataset,
                                              batch_size=None,
                                              sampler=None,
-                                             num_workers=50,
+                                             num_workers=20,
                                              worker_init_fn=wif)
     return dataloader
 
@@ -133,7 +134,7 @@ def train(opt, tr_dataloader, model, loss_fn, optim, lr_scheduler, bg_weight=10.
     val_acc = []
     best_acc = 0
     accum_grad = 2
-    temperature = 20.
+    temperature = 10.
     nemb = opt.inst_embedding_channels
     spatial_scaling = torch.Tensor(
         2 * [1/temperature, ] + [1., ] * (nemb-2))[:, None].to(device)
@@ -148,7 +149,7 @@ def train(opt, tr_dataloader, model, loss_fn, optim, lr_scheduler, bg_weight=10.
         tr_iter = iter(tr_dataloader)
 
         if epoch >= opt.epochs // 4:
-            temperature = 10.
+            temperature = 50.
             spatial_scaling = torch.Tensor(2 * [1/temperature,] + [1.,] * (nemb-2))[:, None].to(device)
 
         if epoch >= opt.epochs // 2:
@@ -163,6 +164,7 @@ def train(opt, tr_dataloader, model, loss_fn, optim, lr_scheduler, bg_weight=10.
 
         for batch_number, batch in enumerate(tqdm(tr_iter)):
             raw, inp, instance_coordinates, y, background_coordinates = batch
+            print(raw.shape, inp.shape, instance_coordinates.shape, y.shape, background_coordinates.shape)
 
             if opt.train_on_raw:
                 inp, y = raw.to(device), y.to(device)
@@ -171,17 +173,30 @@ def train(opt, tr_dataloader, model, loss_fn, optim, lr_scheduler, bg_weight=10.
 
             model_output, sem_embedding = model(inp)
 
+            inst_loss = 0
+            acc = 0
+
             inst_prediction = model_output[0, :, instance_coordinates[:, 1], instance_coordinates[:, 0]]
             bg_inst_prediction = model_output[0, :, background_coordinates[:, 1], background_coordinates[:, 0]]
+
+            bgcoord = torch.stack((background_coordinates[:, 1], background_coordinates[:, 0])).to(device).float()
+            reg = (bg_inst_prediction[:2] - bgcoord)
+            reg = .1 * reg.pow(2).mean()
+
             fg_prediction = sem_embedding[0, :,
-                                          instance_coordinates[:, 1], instance_coordinates[:, 0]]
+                                        instance_coordinates[:, 1], instance_coordinates[:, 0]]
             bg_prediction = sem_embedding[0, :,
-                                          background_coordinates[:, 1], background_coordinates[:, 0]]
+                                        background_coordinates[:, 1], background_coordinates[:, 0]]
+
+            bgsupport = (torch.cat((bgcoord, bg_inst_prediction[2:])) * spatial_scaling).transpose(0, 1)
+
             inst_loss, acc = loss_fn(torch.transpose(spatial_scaling*inst_prediction, 0, 1),
-                                     target=y,
-                                     n_support=opt.num_support_tr,
-                                     temperature=temperature,
-                                     bg_support=(spatial_scaling*bg_inst_prediction).transpose(0, 1))
+                                    target=y,
+                                    n_support=opt.num_support_tr,
+                                    temperature=temperature,
+                                     bg_support=bgsupport)
+
+            acc = acc / len(model_output)
 
             num_fg = fg_prediction.shape[1]
             num_bg = bg_prediction.shape[1]

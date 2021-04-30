@@ -30,6 +30,7 @@ class FastDataset(Dataset):
                  ds_file,
                  num_queries=5,
                  num_support=2,
+                 batchsize=4,
                  num_class_per_iteration=None,
                  lim_images=None,
                  lim_instances_per_image=None,
@@ -48,6 +49,7 @@ class FastDataset(Dataset):
         self._length = 2048
         self._aug_scale = 0.5
         self._aug_pos = None
+        self.batchsize = batchsize
 
         assert (lim_clicks_per_instance is None) or (lim_clicks_per_instance >= num_queries + num_support)
 
