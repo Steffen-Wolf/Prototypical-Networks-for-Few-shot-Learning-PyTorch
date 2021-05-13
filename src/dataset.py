@@ -34,7 +34,10 @@ class FastDataset(Dataset):
                  num_class_per_iteration=None,
                  lim_images=None,
                  lim_instances_per_image=None,
-                 lim_clicks_per_instance=None):
+                 lim_clicks_per_instance=None,
+                 emb_key="embedding",
+                 crop_to=(256, 256),
+                 length=2048):
         super().__init__()
         self.ds_file = ds_file
         self.cache = zarr.open(ds_file, "r")
@@ -46,15 +49,32 @@ class FastDataset(Dataset):
         self.lim_images = lim_images
         self.lim_instances_per_image = lim_instances_per_image
         self.lim_clicks_per_instance = lim_clicks_per_instance
-        self._length = 2048
+        self._length = length
         self._aug_scale = 0.5
         self._aug_pos = None
+        self.emb_key = emb_key
         self.batchsize = batchsize
+        self.crop_to = crop_to
+
+        # trigger data generation to avoid timeout
+        # during first iterations
+        self.data
 
         assert (lim_clicks_per_instance is None) or (lim_clicks_per_instance >= num_queries + num_support)
 
     def __len__(self):
         return self._length
+
+    def check_emb_keys(self, ds):
+        if isinstance(self.emb_key, (list, tuple)):
+            for k in self.emb_key:
+                if k not in ds:
+                    print(f"could not find {k} in {self.ds_file} at {k}")
+                    return False
+        else:
+            if self.emb_key not in ds:
+                return False
+        return True
 
     @property
     def data(self):
@@ -64,16 +84,43 @@ class FastDataset(Dataset):
             ds_array = zarr.open(self.ds_file, "r")
             for img_key in islice(ds_array, self.lim_images):
                 
-                coordinates = []
+                coordinates = {}
+                coordinates["coords"] = []
+                if "raw" not in ds_array[img_key]:
+                    print("could not find raw in ",
+                          self.ds_file, " at ", img_key)
+                    continue
+
+                if not self.check_emb_keys(ds_array[img_key]):
+                    continue
+
+                coordinates["raw"] = ds_array[img_key]["raw"]
+                if isinstance(self.emb_key, (list, tuple)):
+                    coordinates["embedding"] = [ds_array[img_key][k] for k in self.emb_key]
+                else:
+                    coordinates["embedding"] = ds_array[img_key][self.emb_key]
+
                 for instance_key in islice(ds_array[img_key]["foreground"], self.lim_instances_per_image):
                     image_data = {}
-                    image_data["foreground"] = ds_array[img_key]["foreground"][instance_key][:self.lim_clicks_per_instance]
-                    image_data["background"] = ds_array[img_key]["background"][instance_key][:self.lim_clicks_per_instance]
-                    image_data["raw"] = ds_array[img_key]["raw"]
-                    image_data["embedding"] = ds_array[img_key]["embedding"]
-                    coordinates.append(image_data)
+                    # shift = None
+                    # if raw.shape[-2:] != self.crop_to:
+                    #     # crop image around the center
+                    #     shift = ((raw.shape[-2] - self.crop_to[-2])//2, (raw.shape[-1] - self.crop_to[-1])//2)
+                    #     print("fg object ", fg[:10])
+                    #     raw = self.crop(raw, shift)
+
+                    fg = ds_array[img_key]["foreground"][instance_key][:]
+                    bg = ds_array[img_key]["background"][instance_key][:]
+                        # fg, _ = self.crop_coords(fg, shift, self.crop_to)
+                        # bg, _ = self.crop_coords(bg, shift, self.crop_to)
+                        # print("after crop fg,", fg.shape)
+                        # print("after crop bg,", bg.shape)
+                    image_data["foreground"] = fg[:self.lim_clicks_per_instance]
+                    image_data["background"] = bg[:self.lim_clicks_per_instance]
+
+                    coordinates["coords"].append(image_data)
                 assert len(
-                    coordinates), f"no instances found in {self.ds_file}/{img_key}"
+                    coordinates["coords"]), f"no instances found in {self.ds_file}/{img_key}"
                 self._data.append(coordinates)
         return self._data
 
@@ -84,7 +131,7 @@ class FastDataset(Dataset):
         num_labeled_instances = 0
         for img_instanges in self.data:
             num_labeled_images += 1
-            for inst in img_instanges:
+            for inst in img_instanges["coords"]:
                 num_labeled_instances += 1
                 num_labeled_pixels += len(inst["foreground"])
 
@@ -170,28 +217,37 @@ class FastDataset(Dataset):
         self.update_aug_scale()
         return random.choice(self.aug_choices)
 
-    def augment(self,
-                raw,
-                embedding,
-                instance_coordinates,
-                target_data,
-                bg_coordinates):
+    def get_crop(self, img, coord):
+        if any((a > b for a, b in zip(img.shape, self.crop_to))):
+            ox = random.randint(0, img.shape[0]-self.crop_to[0]-1)
+            oy = random.randint(0, img.shape[1]-self.crop_to[1]-1)
+            shift = (ox, oy)
+            if len(self.in_bound_mask(coord, shift)) == 0:
+                # get new random shift
+                return self.get_crop(img, coord)
+            else:
+                return shift
+        return None
 
-        # img_augment, coord_augment = self.get_random_augment()
-        # if img_augment is None:
-        return raw, embedding, instance_coordinates, target_data, bg_coordinates
-        # else:
-        #     if random.random() < 0.1:
-        #         raw = self.scale(raw)
-        #         embedding = self.scale(embedding)
-        #         instance_coordinates = self.scale_cood(instance_coordinates)
-        #         bg_coordinates = self.scale_cood(bg_coordinates)
+    def crop(self, img, shift):
+        print("croping ", img.shape, self.crop_to)
+        ox, oy = shift
+        return img[..., ox:ox+self.crop_to[0], oy:oy+self.crop_to[1]]
 
-        #     return img_augment(raw), \
-        #            img_augment(embedding), \
-        #            coord_augment(instance_coordinates, img_shape=raw.shape[-2:]), \
-        #            target_data, \
-        #            coord_augment(bg_coordinates, img_shape=raw.shape[-2:])
+    def in_bound_mask(self, coord, shift):
+        m0 = coord[:, 0] >= shift[0]
+        m1 = coord[:, 1] >= shift[1]
+        m2 = coord[:, 0] < shift[0] + self.crop_to[0]
+        m3 = coord[:, 1] < shift[1] + self.crop_to[1]
+        return np.logical_and.reduce((m0, m1, m2, m3))
+
+    def crop_coords(self, coord, shift, imgshape):
+        ibm = self.in_bound_mask(coord, shift)
+        coord = coord[ibm].copy()
+        coord[:, 0] -= shift[0]
+        coord[:, 1] -= shift[1]
+        return coord, ibm
+        
     
     def __getitem__(self, _):
 
@@ -205,13 +261,20 @@ class FastDataset(Dataset):
         target_data = []
         target_idx = 0
         num_clicks_per_instance = self.num_queries + self.num_support
-        for inst in image_instances:
-            raw = inst["raw"][:].astype(np.float32)
-            embedding = inst["embedding"][:].astype(np.float32)
+        raw = image_instances["raw"][:].astype(np.float32)
+
+        if isinstance(self.emb_key, (list, tuple)):
+            e = [esqueeze(q[:]).astype(np.float32)
+                 for q in image_instances["embedding"]]
+            embedding = np.concatenate(e, axis=0)
+        else:
+            embedding = image_instances["embedding"][:].astype(np.float32)
+
+        for inst in image_instances["coords"]:
             coord_sample = self.sample(inst["foreground"],
-                                                num_clicks_per_instance)
+                                       num_clicks_per_instance)
             bg_coord_sample = self.sample(inst["background"],
-                                    num_clicks_per_instance*3)
+                                          num_clicks_per_instance*3)
             instance_coordinates.append(coord_sample)
             bg_coordinates.append(bg_coord_sample)
 
@@ -221,5 +284,40 @@ class FastDataset(Dataset):
         # raw, inp, instance_coordinates, y, background_coordinates
         instance_coordinates = np.concatenate(instance_coordinates).astype(np.int64)
         bg_coordinates = np.concatenate(bg_coordinates).astype(np.int64)
+        target_data = np.concatenate(target_data)
+        
+        # shift = self.get_crop(raw, instance_coordinates)
 
-        return self.augment(raw[None, None], embedding[None], instance_coordinates, np.concatenate(target_data), bg_coordinates)
+        # if shift is not None:
+        #     ic, mask = self.crop_coords(
+        #         instance_coordinates, shift, self.crop_to)
+        #     bc, _ = self.crop_coords(bg_coordinates, shift, self.crop_to)
+        #     min_len = self.num_queries + self.num_support
+
+        #     if len(ic) <= min_len or len(bc) <= min_len:
+        #         return self.__getitem__(0)
+
+        #     # while len(ic) <= min_len or len(bc) <= min_len:
+        #         # shift = self.get_crop(raw, instance_coordinates)
+        #         # ic, mask = self.crop_coords(
+        #         #     instance_coordinates, shift, self.crop_to)
+        #         # bc, _ = self.crop_coords(bg_coordinates, shift, self.crop_to)
+
+        #     instance_coordinates = ic
+        #     bg_coordinates = bc
+
+        #     target_data = target_data[mask]
+        #     raw = self.crop(raw, shift)
+        #     embedding = self.crop(embedding, shift)
+        # print(raw.shape, embedding.shape)
+        # assert(len(instance_coordinates) > self.num_queries + self.num_support)
+        # assert(len(bg_coordinates) > self.num_queries + self.num_support)
+        return raw[None, None], embedding[None], instance_coordinates, target_data, bg_coordinates
+
+def esqueeze(x):
+    if x.ndim == 3:
+        return x
+    if x.ndim < 3:
+        return esqueeze(x[None])
+    if x.ndim > 3:
+        return esqueeze(x[0])

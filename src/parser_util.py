@@ -85,7 +85,7 @@ def get_parser():
 
     parser.add_argument('--inst_embedding_channels',
                         type=int,
-                        default=16)
+                        default=4)
 
     parser.add_argument('--lim_images',
                         type=int,
@@ -103,7 +103,23 @@ def get_parser():
                         type=float,
                         default=5.)
 
+    parser.add_argument('--initial_temp',
+                        type=float,
+                        default=4.)
+
+    parser.add_argument('--regularization',
+                        type=float,
+                        default=10.)
+
+    parser.add_argument('--spatial_scaling_factor',
+                        type=float,
+                        default=1.)
+
     parser.add_argument('--train_on_raw',
                         action='store_true')
+
+    parser.add_argument('--num_augmentations',
+                        type=int,
+                        default=0)
 
     return parser

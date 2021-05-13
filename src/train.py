@@ -19,7 +19,7 @@ import os
 import zarr
 from dataset import FastDataset
 from lisl.models.prototypical_network import PrototypicalNetwork, PrototypicalERFNetwork
-
+from torch.utils.data import RandomSampler
 
 def init_seed(opt):
     '''
@@ -33,14 +33,32 @@ def init_seed(opt):
 
 def init_dataloader(opt, mode):
 
-    dataset = FastDataset(opt.dataset_root,
+    if opt.num_augmentations > 0:
+
+        paths = [opt.dataset_root + f"_{i:02}.zarr" for i in range(opt.num_augmentations)]
+        l = 2048 // len(paths)
+        ds = [FastDataset(p,
                           num_queries=opt.num_query_tr,
                           num_support=opt.num_support_tr,
                           num_class_per_iteration=opt.classes_per_it_tr,
                           lim_images=opt.lim_images,
                           lim_instances_per_image=opt.lim_instances_per_image,
-                          lim_clicks_per_instance=opt.lim_clicks_per_instance)
-    num_labeled_images, num_labeled_instances, num_labeled_pixels = dataset.labeled_images_instances_pixels
+                          lim_clicks_per_instance=opt.lim_clicks_per_instance,
+                          emb_key=("cooc_emb", "interm_cooc_emb", "raw"),
+                          length=l) for p in paths]
+
+        num_labeled_images, num_labeled_instances, num_labeled_pixels = ds[0].labeled_images_instances_pixels
+        dataset = torch.utils.data.ConcatDataset(ds)
+    else:
+        dataset = FastDataset(opt.dataset_root,
+                            num_queries=opt.num_query_tr,
+                            num_support=opt.num_support_tr,
+                            num_class_per_iteration=opt.classes_per_it_tr,
+                            lim_images=opt.lim_images,
+                            lim_instances_per_image=opt.lim_instances_per_image,
+                            lim_clicks_per_instance=opt.lim_clicks_per_instance)
+
+        num_labeled_images, num_labeled_instances, num_labeled_pixels = dataset.labeled_images_instances_pixels
     print(
         f"Training with {num_labeled_pixels} clicks, {num_labeled_instances} instances, {num_labeled_images}/{opt.lim_images} images")
 
@@ -52,8 +70,8 @@ def init_dataloader(opt, mode):
     best_model_path = os.path.join(opt.experiment_root, 'best_model.pth')
     dataloader = torch.utils.data.DataLoader(dataset,
                                              batch_size=None,
-                                             sampler=None,
-                                             num_workers=20,
+                                             sampler=RandomSampler(dataset),
+                                             num_workers=2,
                                              worker_init_fn=wif)
     return dataloader
 
@@ -64,7 +82,7 @@ def init_protonet(opt):
     '''
     device = 'cuda:0' if torch.cuda.is_available() and opt.cuda else 'cpu'
     # TODO: make available as options
-    in_channels = 512 + 32 + 1
+    in_channels = 512 + 2 + 1
     inst_out_channels = opt.inst_embedding_channels
     n_sem_classes = 2
 
@@ -128,16 +146,14 @@ def train(opt, tr_dataloader, model, loss_fn, optim, lr_scheduler, bg_weight=10.
     train_loss_log = [0]
     fgbg_loss_log = [0]
     inst_loss_log = [0]
-    # reg_loss_log = [0]
+    reg_loss_log = [0]
     train_acc = []
     val_loss = []
     val_acc = []
     best_acc = 0
-    accum_grad = 2
-    temperature = 10.
+    accum_grad = 16
+    temperature = opt.initial_temp
     nemb = opt.inst_embedding_channels
-    spatial_scaling = torch.Tensor(
-        2 * [1/temperature, ] + [1., ] * (nemb-2))[:, None].to(device)
 
     best_model_path = os.path.join(opt.experiment_root, 'best_model.pth')
     last_model_path = os.path.join(opt.experiment_root, 'last_model.pth')
@@ -148,24 +164,26 @@ def train(opt, tr_dataloader, model, loss_fn, optim, lr_scheduler, bg_weight=10.
         print('=== Epoch: {} ==='.format(epoch))
         tr_iter = iter(tr_dataloader)
 
-        if epoch >= opt.epochs // 4:
-            temperature = 50.
-            spatial_scaling = torch.Tensor(2 * [1/temperature,] + [1.,] * (nemb-2))[:, None].to(device)
-
-        if epoch >= opt.epochs // 2:
-            temperature = 2.
-            spatial_scaling = torch.Tensor(2 * [1/temperature,] + [1.,] * (nemb-2))[:, None].to(device)
-
-        if epoch >= 3* (opt.epochs // 4):
-            temperature = 1.
-            spatial_scaling = torch.Tensor(2 * [1/temperature,] + [1.,] * (nemb-2))[:, None].to(device)
+        if epoch >= 3 * (opt.epochs // 4):
+            temperature = opt.initial_temp / 4.
+            spatial_scaling_factor = 1.
+        elif epoch >= opt.epochs // 2:
+            temperature = opt.initial_temp / 2.
+            spatial_scaling_factor = opt.spatial_scaling_factor
+        elif epoch >= opt.epochs // 4:
+            temperature = opt.initial_temp / 1.5
+            spatial_scaling_factor = opt.spatial_scaling_factor
+        else:
+            spatial_scaling_factor = opt.spatial_scaling_factor ** 2
+        
+        spatial_scaling = torch.Tensor(
+            2 * [1/spatial_scaling_factor, ] + [1., ] * (nemb-2))[:, None].to(device)
 
         model.train()
 
         for batch_number, batch in enumerate(tqdm(tr_iter)):
             raw, inp, instance_coordinates, y, background_coordinates = batch
-            print(raw.shape, inp.shape, instance_coordinates.shape, y.shape, background_coordinates.shape)
-
+            
             if opt.train_on_raw:
                 inp, y = raw.to(device), y.to(device)
             else:
@@ -181,7 +199,7 @@ def train(opt, tr_dataloader, model, loss_fn, optim, lr_scheduler, bg_weight=10.
 
             bgcoord = torch.stack((background_coordinates[:, 1], background_coordinates[:, 0])).to(device).float()
             reg = (bg_inst_prediction[:2] - bgcoord)
-            reg = .1 * reg.pow(2).mean()
+            reg = opt.regularization * reg.pow(2).mean()
 
             fg_prediction = sem_embedding[0, :,
                                         instance_coordinates[:, 1], instance_coordinates[:, 0]]
@@ -207,13 +225,14 @@ def train(opt, tr_dataloader, model, loss_fn, optim, lr_scheduler, bg_weight=10.
                                        sem_target,
                                        weight=weight)
 
-            loss = inst_loss + sem_loss.to(inst_loss.device)# + reg.to(inst_loss.device)
+            loss = inst_loss + sem_loss.to(inst_loss.device) + reg.to(inst_loss.device)
             loss = loss / accum_grad
             loss.backward()
 
             inst_loss_log[-1] += inst_loss.item()
             fgbg_loss_log[-1] += sem_loss.item()
             train_loss_log[-1] += loss.item()
+            reg_loss_log[-1] += reg.item()
 
             if (batch_number + 1) % accum_grad == 0:
                 optim.step()
@@ -222,23 +241,26 @@ def train(opt, tr_dataloader, model, loss_fn, optim, lr_scheduler, bg_weight=10.
                 inst_loss_log.append(0)
                 fgbg_loss_log.append(0)
                 train_loss_log.append(0)
+                reg_loss_log.append(0)
         
             if batch_number % 100 == 0:
-                eout = model_output.detach().cpu().numpy()[0]
-                for c in range(len(eout)):
-                    imsave(f"emb_{batch_number:08}_{c}.png", eout[c])
+                try:
+                    eout = model_output.detach().cpu().numpy()[0]
+                    for c in range(len(eout)):
+                        imsave(f"emb_{batch_number:08}_{c}.png", eout[c])
 
-                clicks = np.zeros(eout[0].shape)
-                clicks[instance_coordinates[:, 1], instance_coordinates[:, 0]] = 1
-                clicks[background_coordinates[:, 1], background_coordinates[:, 0]] = -1
-                print(clicks.shape)
-                imsave(f"raw_{batch_number:08}_clicks.png", clicks)
+                    clicks = np.zeros(eout[0].shape)
+                    clicks[instance_coordinates[:, 1], instance_coordinates[:, 0]] = 1
+                    clicks[background_coordinates[:, 1], background_coordinates[:, 0]] = -1
+                    imsave(f"raw_{batch_number:08}_clicks.png", clicks)
 
-                imsave(f"raw_{batch_number:08}.png",
-                           raw.detach().cpu().numpy()[0, 0])
+                    imsave(f"raw_{batch_number:08}.png",
+                            raw.detach().cpu().numpy()[0, 0])
 
-                sout = sem_embedding.detach().softmax(dim=1).cpu().numpy()[0, 1]
-                imsave(f"sem_{batch_number:08}.png", sout)
+                    sout = sem_embedding.detach().softmax(dim=1).cpu().numpy()[0, 1]
+                    imsave(f"sem_{batch_number:08}.png", sout)
+                except:
+                    pass
 
             train_acc.append(acc.item())
 
@@ -291,7 +313,7 @@ def train(opt, tr_dataloader, model, loss_fn, optim, lr_scheduler, bg_weight=10.
 
     torch.save(model.state_dict(), last_model_path)
 
-    for name in ['train_loss_log', 'train_acc', 'val_loss', 'val_acc', 'inst_loss_log', 'fgbg_loss_log']:
+    for name in ['train_loss_log', 'train_acc', 'val_loss', 'val_acc', 'inst_loss_log', 'fgbg_loss_log', 'reg_loss_log']:
         save_list_to_file(os.path.join(opt.experiment_root,
                                        name + '.txt'), locals()[name])
 
